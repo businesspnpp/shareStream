@@ -1,3 +1,7 @@
+// Hide the black console window in release builds. Keep it for debug so
+// `cargo run` still shows logs interactively.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! win_screen_streamer
 //!
 //! Headless Windows screen streamer:
@@ -47,9 +51,10 @@ use windows_capture::{
 
 // ---- Stream profile -------------------------------------------------------
 
-// Default ingest URL. Override at launch with the SHARESTREAM_WSS env var, e.g.
+// Default ingest URL points at the production Render relay. Override at
+// launch with the SHARESTREAM_WSS env var, e.g.
 //   setx SHARESTREAM_WSS "wss://your-app.onrender.com/ingest"
-const DEFAULT_WSS: &str = "wss://my-screen-streamer.onrender.com/ingest";
+const DEFAULT_WSS: &str = "wss://sharestream-relay.onrender.com/ingest";
 
 fn server_url() -> String {
     std::env::var("SHARESTREAM_WSS").unwrap_or_else(|_| DEFAULT_WSS.to_string())
@@ -302,7 +307,7 @@ fn main() {
         .build()
         .expect("tray icon");
 
-    println!("[UI] System tray ready.");
+    println!("[UI] System tray ready. Ingest endpoint: {}", server_url());
 
     // Native Win32 event loop. ControlFlow::Wait => the thread blocks in
     // GetMessage and consumes ~0% CPU while idle.
