@@ -32,7 +32,9 @@ use tray_icon::{
 };
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
 
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, Profile, RateControlMode};
+use openh264::encoder::{
+    BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, Profile, RateControlMode,
+};
 use openh264::formats::{BgraSliceU8, YUVBuffer};
 use openh264::OpenH264API;
 
@@ -150,7 +152,9 @@ impl GraphicsCaptureApiHandler for CaptureEngine {
                 .max_frame_rate(FrameRate::from_hz(TARGET_FPS as f32))
                 .bitrate(BitRate::from_bps(TARGET_BITRATE))
                 .rate_control_mode(RateControlMode::Bitrate)
-                .profile(Profile::Baseline);
+                .profile(Profile::Baseline)
+                // Periodic IDR every ~2 s so late-joining viewers can decode quickly.
+                .intra_frame_period(IntraFramePeriod::from_num_frames(TARGET_FPS as u32 * 2));
             let api = OpenH264API::from_source();
             self.encoder = Some(Encoder::with_api_config(api, cfg)?);
             eprintln!("[Engine] Encoder initialised for {w}x{h} @ {TARGET_FPS}fps");
