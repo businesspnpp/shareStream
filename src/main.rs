@@ -227,7 +227,7 @@ fn main() {
         }
         Icon::from_rgba(px, 32, 32).unwrap()
     }
-    let idle_icon = solid_icon(80, 80, 80); // gray = idle
+    let idle_icon = solid_icon(0, 200, 255); // bright cyan = idle
     let live_icon = solid_icon(220, 40, 40); // red = streaming
 
     let tray = TrayIconBuilder::new()
