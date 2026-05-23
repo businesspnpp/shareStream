@@ -47,7 +47,14 @@ use windows_capture::{
 
 // ---- Stream profile -------------------------------------------------------
 
-const RENDER_SERVER_WSS: &str = "wss://my-screen-streamer.onrender.com";
+// Default ingest URL. Override at launch with the SHARESTREAM_WSS env var, e.g.
+//   setx SHARESTREAM_WSS "wss://your-app.onrender.com/ingest"
+const DEFAULT_WSS: &str = "wss://my-screen-streamer.onrender.com/ingest";
+
+fn server_url() -> String {
+    std::env::var("SHARESTREAM_WSS").unwrap_or_else(|_| DEFAULT_WSS.to_string())
+}
+
 const TARGET_WIDTH: u32 = 854;
 const TARGET_HEIGHT: u32 = 480;
 const TARGET_FPS: u32 = 30;
@@ -177,10 +184,11 @@ fn drain_stream_into(
 // ---- Network task ---------------------------------------------------------
 
 async fn network_pump(mut rx: mpsc::Receiver<Vec<u8>>) {
-    let (ws, _) = match connect_async(RENDER_SERVER_WSS).await {
+    let url = server_url();
+    let (ws, _) = match connect_async(&url).await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[Network] WSS connect failed: {e}");
+            eprintln!("[Network] WSS connect to {url} failed: {e}");
             return;
         }
     };
