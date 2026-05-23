@@ -13,11 +13,14 @@
 //! every frame via WebCodecs with sub-second latency. The relay records the
 //! raw NAL stream which is a fully playable .h264 file (VLC / ffmpeg).
 
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::thread;
+use std::time::Duration;
 
 use futures_util::SinkExt;
 use tokio::sync::mpsc;
@@ -51,6 +54,38 @@ fn server_url() -> String {
 
 const TARGET_FPS: u32 = 30;
 const TARGET_BITRATE: u32 = 600_000; // ~600 kbps
+
+// Loopback control port. Any second invocation talks to this to drive the
+// already-running tray instance.
+const CONTROL_ADDR: &str = "127.0.0.1:47654";
+
+#[cfg(windows)]
+fn attach_parent_console() {
+    // Re-attach stdout to the parent shell so println! reaches PowerShell.
+    extern "system" {
+        fn AttachConsole(pid: u32) -> i32;
+    }
+    const ATTACH_PARENT: u32 = 0xFFFF_FFFF;
+    unsafe {
+        AttachConsole(ATTACH_PARENT);
+    }
+}
+
+fn send_control(cmd: &str) -> std::io::Result<String> {
+    let mut s = TcpStream::connect_timeout(
+        &CONTROL_ADDR.parse().unwrap(),
+        Duration::from_millis(500),
+    )?;
+    s.set_read_timeout(Some(Duration::from_secs(2)))?;
+    s.write_all(cmd.trim().as_bytes())?;
+    s.write_all(b"\n")?;
+    let _ = s.shutdown(Shutdown::Write);
+    let mut buf = Vec::with_capacity(64);
+    // Ignore RSTs after a successful read — we only care about whatever the
+    // server flushed before closing.
+    let _ = s.read_to_end(&mut buf);
+    Ok(String::from_utf8_lossy(&buf).trim().to_string())
+}
 
 // ---- Shared control state -------------------------------------------------
 
@@ -197,7 +232,50 @@ fn start_capture(alive: Arc<AtomicBool>, rt: tokio::runtime::Handle) -> thread::
 
 // ---- Main: tray + Win32 message loop --------------------------------------
 
+#[derive(Clone, Copy)]
+enum Cmd {
+    Start,
+    Stop,
+    Exit,
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let sub = args.first().map(|s| s.to_lowercase()).unwrap_or_default();
+
+    // Try to claim the control port. If something else owns it, we are a
+    // second invocation: forward the user's command and exit.
+    let listener = match TcpListener::bind(CONTROL_ADDR) {
+        Ok(l) => l,
+        Err(_) => {
+            #[cfg(windows)]
+            attach_parent_console();
+            let to_send = if sub.is_empty() { "status" } else { sub.as_str() };
+            match send_control(to_send) {
+                Ok(resp) => {
+                    println!("{resp}");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("control error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
+    // We're the primary instance. If user invoked with stop/status/exit but
+    // no other instance was running, report it and quit (don't pop the tray).
+    if matches!(sub.as_str(), "stop" | "status" | "exit") {
+        #[cfg(windows)]
+        attach_parent_console();
+        println!("no running instance");
+        drop(listener);
+        std::process::exit(2);
+    }
+
+    let auto_start = sub == "start";
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -210,6 +288,53 @@ fn main() {
         capture_alive: Arc::new(AtomicBool::new(false)),
         capture_thread: Mutex::new(None),
     });
+
+    // Channel: control-listener thread -> event loop.
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
+
+    // Accept thread for the control port.
+    {
+        let tx = cmd_tx.clone();
+        let recording_flag = state.is_recording.clone();
+        thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(mut s) = incoming else { continue };
+                let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
+                let mut buf = [0u8; 32];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let line = std::str::from_utf8(&buf[..n])
+                    .unwrap_or("")
+                    .trim()
+                    .to_lowercase();
+                let reply = match line.as_str() {
+                    "start" => {
+                        let _ = tx.send(Cmd::Start);
+                        "ok: starting"
+                    }
+                    "stop" => {
+                        let _ = tx.send(Cmd::Stop);
+                        "ok: stopping"
+                    }
+                    "exit" | "quit" => {
+                        let _ = tx.send(Cmd::Exit);
+                        "ok: exiting"
+                    }
+                    "status" => {
+                        if recording_flag.load(Ordering::SeqCst) {
+                            "streaming"
+                        } else {
+                            "idle"
+                        }
+                    }
+                    _ => "err: unknown command (start|stop|status|exit)",
+                };
+                let _ = s.write_all(reply.as_bytes());
+                let _ = s.write_all(b"\n");
+                let _ = s.flush();
+                let _ = s.shutdown(Shutdown::Both);
+            }
+        });
+    }
 
     let tray_menu = Menu::new();
     let start_item = MenuItem::new("Start Live Stream", true, None);
@@ -240,6 +365,10 @@ fn main() {
 
     eprintln!("[UI] System tray ready. Ingest endpoint: {}", server_url());
 
+    if auto_start {
+        let _ = cmd_tx.send(Cmd::Start);
+    }
+
     let event_loop = EventLoopBuilder::new().build().expect("event loop");
     let menu_rx = MenuEvent::receiver();
 
@@ -247,46 +376,84 @@ fn main() {
     let stop_id = stop_item.id().clone();
     let exit_id = exit_item.id().clone();
 
+    // Closures to centralise start/stop/exit so menu clicks and CLI commands
+    // run the exact same code paths.
+    let do_start = {
+        let state = state.clone();
+        let tray = tray.clone();
+        let live_icon = live_icon.clone();
+        let rt_handle = rt_handle.clone();
+        let start_item = start_item.clone();
+        let stop_item = stop_item.clone();
+        move || {
+            if state.is_recording.load(Ordering::SeqCst) {
+                return;
+            }
+            eprintln!("[CTL] start");
+            state.is_recording.store(true, Ordering::SeqCst);
+            state.capture_alive.store(true, Ordering::Relaxed);
+            start_item.set_enabled(false);
+            stop_item.set_enabled(true);
+            let _ = tray.set_icon(Some(live_icon.clone()));
+            let _ = tray.set_tooltip(Some(format!(
+                "ShareStream — LIVE\nIngest: {}",
+                server_url()
+            )));
+            let h = start_capture(state.capture_alive.clone(), rt_handle.clone());
+            *state.capture_thread.lock().unwrap() = Some(h);
+        }
+    };
+    let do_stop = {
+        let state = state.clone();
+        let tray = tray.clone();
+        let idle_icon = idle_icon.clone();
+        let start_item = start_item.clone();
+        let stop_item = stop_item.clone();
+        move || {
+            if !state.is_recording.load(Ordering::SeqCst) {
+                return;
+            }
+            eprintln!("[CTL] stop");
+            state.capture_alive.store(false, Ordering::Relaxed);
+            if let Some(h) = state.capture_thread.lock().unwrap().take() {
+                let _ = h.join();
+            }
+            state.is_recording.store(false, Ordering::SeqCst);
+            start_item.set_enabled(true);
+            stop_item.set_enabled(false);
+            let _ = tray.set_icon(Some(idle_icon.clone()));
+            let _ = tray.set_tooltip(Some(format!(
+                "ShareStream — idle\nIngest: {}",
+                server_url()
+            )));
+        }
+    };
+
     event_loop
         .run(move |_event, target| {
-            target.set_control_flow(ControlFlow::Wait);
+            // Short timed wait so we can poll the CLI control channel without
+            // burning CPU. ~0% idle on modern hardware.
+            target.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(100)));
 
             while let Ok(ev) = menu_rx.try_recv() {
-                if ev.id == start_id && !state.is_recording.load(Ordering::SeqCst) {
-                    eprintln!("[UI] Start clicked.");
-                    state.is_recording.store(true, Ordering::SeqCst);
-                    state.capture_alive.store(true, Ordering::Relaxed);
-                    start_item.set_enabled(false);
-                    stop_item.set_enabled(true);
-                    let _ = tray.set_icon(Some(live_icon.clone()));
-                    let _ = tray.set_tooltip(Some(format!(
-                        "ShareStream — LIVE\nIngest: {}",
-                        server_url()
-                    )));
-
-                    let h = start_capture(state.capture_alive.clone(), rt_handle.clone());
-                    *state.capture_thread.lock().unwrap() = Some(h);
-                } else if ev.id == stop_id && state.is_recording.load(Ordering::SeqCst) {
-                    eprintln!("[UI] Stop clicked.");
-                    state.capture_alive.store(false, Ordering::Relaxed);
-                    if let Some(h) = state.capture_thread.lock().unwrap().take() {
-                        let _ = h.join();
-                    }
-                    state.is_recording.store(false, Ordering::SeqCst);
-                    start_item.set_enabled(true);
-                    stop_item.set_enabled(false);
-                    let _ = tray.set_icon(Some(idle_icon.clone()));
-                    let _ = tray.set_tooltip(Some(format!(
-                        "ShareStream — idle\nIngest: {}",
-                        server_url()
-                    )));
+                if ev.id == start_id {
+                    do_start();
+                } else if ev.id == stop_id {
+                    do_stop();
                 } else if ev.id == exit_id {
-                    eprintln!("[UI] Exit clicked.");
-                    state.capture_alive.store(false, Ordering::Relaxed);
-                    if let Some(h) = state.capture_thread.lock().unwrap().take() {
-                        let _ = h.join();
-                    }
+                    do_stop();
                     target.exit();
+                }
+            }
+
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    Cmd::Start => do_start(),
+                    Cmd::Stop => do_stop(),
+                    Cmd::Exit => {
+                        do_stop();
+                        target.exit();
+                    }
                 }
             }
         })
