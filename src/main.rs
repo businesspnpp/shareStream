@@ -36,6 +36,8 @@ use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, Profile, Rat
 use openh264::formats::{BgraSliceU8, YUVBuffer};
 use openh264::OpenH264API;
 
+mod device;
+
 use windows_capture::{
     capture::GraphicsCaptureApiHandler,
     frame::Frame,
@@ -48,8 +50,20 @@ use windows_capture::{
 
 const DEFAULT_WSS: &str = "wss://sharestream-relay.onrender.com/ingest";
 
-fn server_url() -> String {
+fn server_url_base() -> String {
     std::env::var("SHARESTREAM_WSS").unwrap_or_else(|_| DEFAULT_WSS.to_string())
+}
+
+/// Returns wss://host/ingest/<device_id>
+fn server_url_for(device_id: &str) -> String {
+    let base = server_url_base();
+    let trimmed = base.trim_end_matches('/');
+    format!("{trimmed}/{device_id}")
+}
+
+// Kept for tooltip display.
+fn server_url() -> String {
+    server_url_base()
 }
 
 const TARGET_FPS: u32 = 30;
@@ -175,8 +189,8 @@ struct EngineFlags {
 
 // ---- Network task ---------------------------------------------------------
 
-async fn network_pump(mut rx: mpsc::Receiver<Vec<u8>>) {
-    let url = server_url();
+async fn network_pump(mut rx: mpsc::Receiver<Vec<u8>>, device_id: String, info_json: String) {
+    let url = server_url_for(&device_id);
     let (ws, _) = match connect_async(&url).await {
         Ok(v) => v,
         Err(e) => {
@@ -185,7 +199,14 @@ async fn network_pump(mut rx: mpsc::Receiver<Vec<u8>>) {
         }
     };
     let (mut sink, _) = futures_util::StreamExt::split(ws);
-    eprintln!("[Network] Tunnel established.");
+    eprintln!("[Network] Tunnel established for device {device_id}.");
+
+    // First frame: device metadata (text JSON). Relay treats first text
+    // message as the registration blob.
+    if let Err(e) = sink.send(Message::Text(info_json)).await {
+        eprintln!("[Network] Failed to send device metadata: {e}");
+        return;
+    }
 
     while let Some(chunk) = rx.recv().await {
         if let Err(e) = sink.send(Message::Binary(chunk)).await {
@@ -198,10 +219,15 @@ async fn network_pump(mut rx: mpsc::Receiver<Vec<u8>>) {
 
 // ---- Capture lifecycle ----------------------------------------------------
 
-fn start_capture(alive: Arc<AtomicBool>, rt: tokio::runtime::Handle) -> thread::JoinHandle<()> {
+fn start_capture(
+    alive: Arc<AtomicBool>,
+    rt: tokio::runtime::Handle,
+    device_id: String,
+    info_json: String,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(32);
-        rt.spawn(network_pump(rx));
+        rt.spawn(network_pump(rx, device_id, info_json));
 
         let monitor = match Monitor::primary() {
             Ok(m) => m,
@@ -274,7 +300,33 @@ fn main() {
         std::process::exit(2);
     }
 
+    // `info` dumps device metadata as JSON to a file (windows subsystem
+    // blocks normal stdout redirection) and exits.
+    if sub == "info" {
+        #[cfg(windows)]
+        attach_parent_console();
+        let info = device::collect();
+        let json = serde_json::to_string_pretty(&info).unwrap_or_default();
+        let out_path = std::env::temp_dir().join("sharestream_info.json");
+        let _ = std::fs::write(&out_path, &json);
+        println!("wrote {}", out_path.display());
+        drop(listener);
+        std::process::exit(0);
+    }
+
     let auto_start = sub == "start";
+
+    // Collect identity + telemetry once at startup. Cheap (~few ms) and
+    // exposed to the relay so the viewer can list machines.
+    let device_info = device::collect();
+    let device_id = device_info.device_id.clone();
+    let hostname_display = device_info.hostname.clone();
+    let device_info_json = serde_json::to_string(&device_info)
+        .unwrap_or_else(|_| "{}".to_string());
+    eprintln!(
+        "[Device] id={} host={} ip={:?}",
+        device_id, hostname_display, device_info.primary_ipv4
+    );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -357,7 +409,10 @@ fn main() {
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
-        .with_tooltip(format!("ShareStream — idle\nIngest: {}", server_url()))
+        .with_tooltip(format!(
+            "ShareStream — idle\n{} [{}]\nIngest: {}",
+            hostname_display, device_id, server_url()
+        ))
         .with_icon(idle_icon.clone())
         .build()
         .expect("tray icon");
@@ -385,6 +440,9 @@ fn main() {
         let rt_handle = rt_handle.clone();
         let start_item = start_item.clone();
         let stop_item = stop_item.clone();
+        let device_id = device_id.clone();
+        let device_info_json = device_info_json.clone();
+        let hostname_display = hostname_display.clone();
         move || {
             if state.is_recording.load(Ordering::SeqCst) {
                 return;
@@ -396,10 +454,15 @@ fn main() {
             stop_item.set_enabled(true);
             let _ = tray.set_icon(Some(live_icon.clone()));
             let _ = tray.set_tooltip(Some(format!(
-                "ShareStream — LIVE\nIngest: {}",
-                server_url()
+                "ShareStream — LIVE\n{} [{}]\nIngest: {}",
+                hostname_display, device_id, server_url()
             )));
-            let h = start_capture(state.capture_alive.clone(), rt_handle.clone());
+            let h = start_capture(
+                state.capture_alive.clone(),
+                rt_handle.clone(),
+                device_id.clone(),
+                device_info_json.clone(),
+            );
             *state.capture_thread.lock().unwrap() = Some(h);
         }
     };
@@ -409,6 +472,8 @@ fn main() {
         let idle_icon = idle_icon.clone();
         let start_item = start_item.clone();
         let stop_item = stop_item.clone();
+        let device_id = device_id.clone();
+        let hostname_display = hostname_display.clone();
         move || {
             if !state.is_recording.load(Ordering::SeqCst) {
                 return;
@@ -423,8 +488,8 @@ fn main() {
             stop_item.set_enabled(false);
             let _ = tray.set_icon(Some(idle_icon.clone()));
             let _ = tray.set_tooltip(Some(format!(
-                "ShareStream — idle\nIngest: {}",
-                server_url()
+                "ShareStream — idle\n{} [{}]\nIngest: {}",
+                hostname_display, device_id, server_url()
             )));
         }
     };
