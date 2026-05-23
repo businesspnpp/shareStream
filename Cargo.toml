@@ -16,6 +16,10 @@ strip = "symbols"
 # Pinned — 1.5+ broke the Settings::new and VideoEncoder builder APIs.
 windows-capture = "=1.3.6"
 
+# Software H.264 encoder. We emit raw Annex-B NALUs so the browser can
+# decode with WebCodecs without needing fragmented-MP4 muxing.
+openh264 = "0.9"
+
 # Microscopic System Tray UI (no HWND, no GDI window class for content).
 tray-icon = "0.13"
 winit      = { version = "0.29", features = ["rwh_06"] }
@@ -24,14 +28,3 @@ winit      = { version = "0.29", features = ["rwh_06"] }
 tokio              = { version = "1.35", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 tokio-tungstenite  = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 futures-util       = { version = "0.3", default-features = false, features = ["sink"] }
-
-# Direct Win32 / WinRT bindings for the in-memory stream that bridges
-# the GPU-side encoder output into the async network task.
-[dependencies.windows]
-version  = "=0.58.0"
-features = [
-    "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
-    "Foundation",          # IAsyncOperation<T> for DataReader::LoadAsync
-    "Storage_Streams",
-]
