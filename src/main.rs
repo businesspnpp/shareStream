@@ -219,13 +219,24 @@ fn main() {
         .append_items(&[&start_item, &stop_item, &exit_item])
         .unwrap();
 
-    let icon_rgba = vec![0u8; 16 * 16 * 4];
-    let _tray = TrayIconBuilder::new()
+    // Solid colored 32x32 icons so the tray entry is actually visible.
+    fn solid_icon(r: u8, g: u8, b: u8) -> Icon {
+        let mut px = Vec::with_capacity(32 * 32 * 4);
+        for _ in 0..(32 * 32) {
+            px.extend_from_slice(&[r, g, b, 255]);
+        }
+        Icon::from_rgba(px, 32, 32).unwrap()
+    }
+    let idle_icon = solid_icon(80, 80, 80); // gray = idle
+    let live_icon = solid_icon(220, 40, 40); // red = streaming
+
+    let tray = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
-        .with_tooltip("Rust Screen Streamer (Low Footprint)")
-        .with_icon(Icon::from_rgba(icon_rgba, 16, 16).unwrap())
+        .with_tooltip(format!("ShareStream — idle\nIngest: {}", server_url()))
+        .with_icon(idle_icon.clone())
         .build()
         .expect("tray icon");
+    let tray = Arc::new(tray);
 
     eprintln!("[UI] System tray ready. Ingest endpoint: {}", server_url());
 
@@ -247,6 +258,11 @@ fn main() {
                     state.capture_alive.store(true, Ordering::Relaxed);
                     start_item.set_enabled(false);
                     stop_item.set_enabled(true);
+                    let _ = tray.set_icon(Some(live_icon.clone()));
+                    let _ = tray.set_tooltip(Some(format!(
+                        "ShareStream — LIVE\nIngest: {}",
+                        server_url()
+                    )));
 
                     let h = start_capture(state.capture_alive.clone(), rt_handle.clone());
                     *state.capture_thread.lock().unwrap() = Some(h);
@@ -259,6 +275,11 @@ fn main() {
                     state.is_recording.store(false, Ordering::SeqCst);
                     start_item.set_enabled(true);
                     stop_item.set_enabled(false);
+                    let _ = tray.set_icon(Some(idle_icon.clone()));
+                    let _ = tray.set_tooltip(Some(format!(
+                        "ShareStream — idle\nIngest: {}",
+                        server_url()
+                    )));
                 } else if ev.id == exit_id {
                     eprintln!("[UI] Exit clicked.");
                     state.capture_alive.store(false, Ordering::Relaxed);
