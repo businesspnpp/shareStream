@@ -1,0 +1,36 @@
+[package]
+name = "win_screen_streamer"
+version = "0.1.0"
+edition = "2021"
+
+# Aggressive size/perf profile for a "background daemon" binary.
+[profile.release]
+opt-level = "z"      # Optimize for size (microscopic memory + binary footprint).
+lto = "fat"          # Cross-crate inlining; strips dead Windows API surface.
+codegen-units = 1
+panic = "abort"      # No unwinding tables -> smaller .text, lower RSS.
+strip = "symbols"
+
+[dependencies]
+# Native High-Performance Windows Graphics Capture (WGC) wrapper.
+# Exposes the D3D11 texture surface and the hardware H.264 encoder MFT.
+windows-capture = "1.3"
+
+# Microscopic System Tray UI (no HWND, no GDI window class for content).
+tray-icon = "0.13"
+winit      = { version = "0.29", features = ["rwh_06"] }
+
+# Async runtime + low-overhead WSS client.
+tokio              = { version = "1.35", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio-tungstenite  = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+futures-util       = { version = "0.3", default-features = false, features = ["sink"] }
+
+# Direct Win32 / WinRT bindings for the in-memory stream that bridges
+# the GPU-side encoder output into the async network task.
+[dependencies.windows]
+version  = "0.52"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Storage_Streams",
+]
