@@ -33,15 +33,13 @@ use tray_icon::{
 };
 use winit::event_loop::{ControlFlow, EventLoopBuilder};
 
-use windows::Storage::Streams::{
-    Buffer, DataReader, InMemoryRandomAccessStream, InputStreamOptions,
-};
+use windows::core::Interface;
+use windows::Storage::Streams::{DataReader, IRandomAccessStream, InMemoryRandomAccessStream, InputStreamOptions};
 
 use windows_capture::{
-    capture::{Context, GraphicsCaptureApiHandler},
+    capture::GraphicsCaptureApiHandler,
     encoder::{
-        AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoEncoderQuality,
-        VideoEncoderType, VideoSettingsBuilder,
+        AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder,
     },
     frame::Frame,
     graphics_capture_api::InternalCaptureControl,
@@ -93,26 +91,25 @@ impl GraphicsCaptureApiHandler for CaptureEngine {
     type Flags = EngineFlags;
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
-    fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+    fn new(flags: Self::Flags) -> Result<Self, Self::Error> {
         // --- GPU TEXTURE PIPELINE -------------------------------------------------
-        // VideoEncoder wraps a Media Foundation Sink Writer. We request the H.264
-        // hardware MFT and tell it the *output* resolution is 854x480; MF inserts
-        // a GPU video processor that downscales the incoming full-screen D3D11
-        // texture on the graphics card. We never copy a full-res frame to RAM.
+        // VideoEncoder wraps a Media Foundation Sink Writer. The encoder's *output*
+        // resolution is 854x480; MF inserts a GPU video processor that downscales the
+        // incoming full-screen D3D11 texture on the graphics card. We never copy a
+        // full-res frame to RAM. Container defaults to MP4 / H.264.
+        let stream: IRandomAccessStream = flags.stream.cast()?;
         let encoder = VideoEncoder::new_from_stream(
             VideoSettingsBuilder::new(TARGET_WIDTH, TARGET_HEIGHT)
                 .frame_rate(TARGET_FPS)
-                .bitrate(TARGET_BITRATE)
-                .sub_type(VideoEncoderType::H264)
-                .quality(VideoEncoderQuality::Auto),
+                .bitrate(TARGET_BITRATE),
             AudioSettingsBuilder::default().disabled(true),
             ContainerSettingsBuilder::default(),
-            &ctx.flags.stream,
+            stream,
         )?;
 
         Ok(Self {
             encoder: Some(encoder),
-            alive: ctx.flags.alive,
+            alive: flags.alive,
         })
     }
 
@@ -166,7 +163,6 @@ fn drain_stream_into(
     let reader = DataReader::CreateDataReader(&input)?;
     reader.SetInputStreamOptions(InputStreamOptions::Partial)?;
 
-    let buffer = Buffer::Create(NETWORK_CHUNK)?;
     while alive.load(Ordering::Relaxed) {
         let loaded = reader.LoadAsync(NETWORK_CHUNK)?.get()?;
         if loaded == 0 {
@@ -174,11 +170,8 @@ fn drain_stream_into(
             thread::sleep(Duration::from_millis(4));
             continue;
         }
-        let _ = reader.ReadBuffer(&buffer)?;
-        let len = buffer.Length()? as usize;
-        let mut chunk = vec![0u8; len];
-        let view = DataReader::FromBuffer(&buffer)?;
-        view.ReadBytes(&mut chunk)?;
+        let mut chunk = vec![0u8; loaded as usize];
+        reader.ReadBytes(&mut chunk)?;
 
         // try_send: if the network is congested we drop rather than balloon RAM.
         let _ = tx.try_send(chunk);
