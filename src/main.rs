@@ -40,6 +40,100 @@ use openh264::OpenH264API;
 
 mod device;
 
+// ---- Anti-mirror: hide viewer windows from screen capture -----------------
+//
+// When the user watches their own live stream in a browser on the same
+// monitor that is being captured, the result is the "hall of mirrors"
+// feedback loop (the browser shows the stream, which contains the browser,
+// which contains the stream, …). Windows 10 2004+ supports
+// `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` which tells WGC
+// to skip the marked window during capture — this is what apps like Zoom
+// and Discord use to hide their own preview/overlay UI.
+//
+// We periodically enumerate top-level windows and tag any whose title
+// contains one of `MIRROR_BLOCKLIST` (case-insensitive) plus anything from
+// the optional `SHARESTREAM_EXCLUDE_TITLES` env var (comma-separated).
+mod mirror_guard {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::sync::OnceLock;
+
+    // Minimal hand-rolled Win32 bindings — pulling in `windows-sys` for these
+    // four functions blows out the linker's memory budget.
+    type Hwnd = *mut std::ffi::c_void;
+    type Lparam = isize;
+    type Bool = i32;
+    type WndEnumProc = unsafe extern "system" fn(Hwnd, Lparam) -> Bool;
+
+    const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
+
+    extern "system" {
+        fn EnumWindows(lp_enum_func: WndEnumProc, l_param: Lparam) -> Bool;
+        fn IsWindowVisible(hwnd: Hwnd) -> Bool;
+        fn GetWindowTextLengthW(hwnd: Hwnd) -> i32;
+        fn GetWindowTextW(hwnd: Hwnd, lp_string: *mut u16, n_max_count: i32) -> i32;
+        fn SetWindowDisplayAffinity(hwnd: Hwnd, dw_affinity: u32) -> Bool;
+    }
+
+    /// Window-title substrings (case-insensitive) that we always hide from capture.
+    const MIRROR_BLOCKLIST: &[&str] = &[
+        "sharestream — devices", // viewer page <title> (em dash)
+        "sharestream - devices", // ASCII fallback
+        "sharestream devices",
+    ];
+
+    fn extra_titles() -> &'static Vec<String> {
+        static CACHE: OnceLock<Vec<String>> = OnceLock::new();
+        CACHE.get_or_init(|| {
+            std::env::var("SHARESTREAM_EXCLUDE_TITLES")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+    }
+
+    fn title_matches(title_lower: &str) -> bool {
+        MIRROR_BLOCKLIST.iter().any(|n| title_lower.contains(n))
+            || extra_titles().iter().any(|n| title_lower.contains(n))
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: Hwnd, _lparam: Lparam) -> Bool {
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return 1;
+        }
+        let mut buf = vec![0u16; (len as usize) + 1];
+        let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if n <= 0 {
+            return 1;
+        }
+        let title = OsString::from_wide(&buf[..n as usize])
+            .to_string_lossy()
+            .to_lowercase();
+        if title_matches(&title) {
+            let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        }
+        1
+    }
+
+    /// Spawn a low-frequency thread that re-applies WDA_EXCLUDEFROMCAPTURE.
+    /// New windows (new browser tabs) appear constantly; one sweep per second
+    /// is enough latency-wise and the cost is negligible.
+    pub fn spawn() {
+        std::thread::spawn(|| loop {
+            unsafe {
+                let _ = EnumWindows(enum_proc, 0);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+    }
+}
+
 use windows_capture::{
     capture::GraphicsCaptureApiHandler,
     frame::Frame,
@@ -338,6 +432,10 @@ fn main() {
         .build()
         .expect("tokio runtime");
     let rt_handle = rt.handle().clone();
+
+    // Continuously hide the browser viewer window from screen capture so the
+    // user can watch their own stream without infinite mirror feedback.
+    mirror_guard::spawn();
 
     let state = Arc::new(AppState {
         is_recording: Arc::new(AtomicBool::new(false)),
